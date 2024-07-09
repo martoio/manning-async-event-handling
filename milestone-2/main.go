@@ -6,9 +6,11 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/confluentinc/confluent-kafka-go/kafka"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/martoio/manning-async-event-handling/events"
+	"github.com/martoio/manning-async-event-handling/models"
+	"github.com/martoio/manning-async-event-handling/publisher"
 )
 
 type OrderReceivedMessageBody struct {
@@ -22,6 +24,11 @@ type OrderReceivedMessage struct {
 }
 
 func main() {
+
+	orderStore := models.OrderStore{
+		Orders: make([]models.Order, 0),
+	}
+
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
@@ -30,46 +37,31 @@ func main() {
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
-	http.ListenAndServe(":3000", r)
-
-	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "localhost"})
-	if err != nil {
-		panic(err)
-	}
-	defer p.Close()
-
-	go func() {
-		for e := range p.Events() {
-			switch ev := e.(type) {
-			case *kafka.Message:
-				if ev.TopicPartition.Error != nil {
-					fmt.Printf("Delivery failed: %v\n", ev.TopicPartition)
-				} else {
-					fmt.Printf("Delivered message to %v\n", ev.TopicPartition)
-				}
-			}
+	r.Post("/orders", func(w http.ResponseWriter, r *http.Request) {
+		type Body struct {
+			Name       string `json:"name"`
+			ProductIds []int  `json:"productIds"`
+			CustomerId int    `json:"customerId"`
 		}
-	}()
+		var orderBody Body
+		err := json.NewDecoder(r.Body).Decode(&orderBody)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 
-	topic := "OrdersReceived"
+		newOrder := orderStore.NewOrder(models.NewOrderParams{
+			Name:       orderBody.Name,
+			ProductIds: orderBody.ProductIds,
+			CustomerId: orderBody.CustomerId,
+		})
+		publisher.PublishEvent(events.OrderReceivedEvent{
+			EventId:        newOrder.ID,
+			EventTimestamp: newOrder.CreatedAt,
+			EventBody:      *newOrder,
+		}, events.OrdersReceivedTopic)
 
-	msg := OrderReceivedMessage{
-		Id:        1,
-		Name:      "Test",
-		Timestamp: time.Now(),
-		Body:      OrderReceivedMessageBody{},
-	}
-
-	msgJson, err := json.Marshal(msg)
-	if err != nil {
-		panic(err)
-	}
-
-	p.Produce(&kafka.Message{
-		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
-		Value:          msgJson,
-	}, nil)
-
-	// Wait for message deliveries before shutting down
-	p.Flush(15 * 1000)
+	})
+	fmt.Println("Listening on port 3100")
+	http.ListenAndServe(":3100", r)
 }
